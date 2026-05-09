@@ -1,0 +1,3 @@
+# Scope MVP around the governed Skill supply chain
+
+The MVP covers the governed path from Skill creation to offline runtime use: Skill Workbench, Registry service, OCI artifact publication, signing, SBOM, Skill Lockfile, minimal Community Skill ingestion, Local Skill Registry import, Controller read-only mounting, local signature-verified hot-loading, basic permission mapping, and a smoke Skill Evaluation gate. Advanced marketplace recommendation, automatic global reuse from customer environments, full support for every isolation backend, and cross-customer analytics are deferred so the first release proves the secure supply-chain and runtime loop end to end.
