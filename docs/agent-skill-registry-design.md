@@ -1,6 +1,24 @@
 # Agent Skill Registry 技术设计文档
 
 
+## 0. 交付摘要
+
+本方案面向 Z 司内部 ADP 平台，为平台研发和 FDE 提供 Agent Skill Registry 能力。设计同时覆盖 ADP 在线开发环境与客户离线私有化 K3S 环境，重点解决 Skill 的发现、开发、评测、发布、签名、依赖锁定、离线导出、本地导入、Controller 挂载、运行时热加载、运行时 Draft 创建、追踪和撤销。
+
+MVP 不追求生产级外部依赖接入，而是验证受控供应链闭环：
+
+- FDE 在 Workbench 创建 Skill Draft，声明 Runtime Payload、Permission Manifest 和 smoke Evaluation。
+- Registry 对 Draft 做策略校验、评测门禁、SBOM/provenance 生成、签名和 Published Skill 元数据发布。
+- ADP 摄取固定版本的 Community Skill，锁定来源、检查许可证/扫描结果，并重签为 Z 信任根下的 Published Skill。
+- Agent Profile 发布时生成 Skill Lockfile，冻结 Skill 版本、digest、签名、SBOM/provenance 和权限摘要。
+- Offline Deployment Bundle 携带 Lockfile、Policy Snapshot、Skill Artifact、签名和 Revocation List。
+- 客户环境导入 Bundle 到 Local Skill Registry，Controller 根据 Lockfile 生成只读挂载计划和 K8S 权限资源映射。
+- Agent Runtime 只加载本地已验签、未撤销、digest 匹配的 Skill，并记录 Skill Invocation Trace。
+- 运行中 Agent 可以创建 Skill Draft，但 Draft 默认不可执行，必须经评测和本地发布成为 Local Published Skill。
+- 客户安全人员可以离线导入 signed Revocation List，阻止被撤销 Skill 后续挂载和热加载。
+
+当前仓库中的 MVP 实现为单进程 Go 服务，使用本地磁盘保存 OCI-like Artifact，用 HMAC 模拟签名，用确定性的 Controller Mount Plan 模拟 K3S Controller 行为。该实现用于验证要求的端到端设计闭环，生产化替换点在演进路线中说明。
+
 ## 1. 背景与目标
 
 Z 司是一家专注强数据安全领域的 AI Agent 公司。内部 ADP 平台面向平台研发和 FDE，产出可部署到客户离线私有化 K3S 集群的 Agent Profile。Agent Profile 会声明对 Agent Skill 的依赖；客户环境中的 Controller 需要把这些 Skill 安全、可审计、可复现地挂载进 Agent Pod，并支持运行时热加载。
@@ -32,20 +50,23 @@ Z 司是一家专注强数据安全领域的 AI Agent 公司。内部 ADP 平台
 
 ### 3.1 MVP 范围
 
-MVP 必须完成从 Skill 创建到客户离线运行的受控闭环：
+MVP 必须完成从 Skill 创建到客户离线运行的受控闭环。为了交付周期内证明关键设计，本设计把 MVP 分成“可运行验证版”和“生产替换点”两层：可运行验证版使用本地文件、HMAC 和模拟 Controller；生产替换点保持 API、schema 和领域模型稳定，后续替换为真实 OCI Registry、Sigstore/cosign、OPA 和 Kubernetes Controller。
+
+MVP 可运行验证版包含：
 
 - Skill Workbench 最小可用流：创建、模板、依赖选择、权限向导、沙箱测试、smoke evaluation、提交发布。
 - Registry Service：Skill 元数据、版本、命名空间、可见性、状态流转、搜索。
-- OCI Artifact 发布：manifest、runtime payload、assets、evaluation artifacts、SBOM、provenance、签名。
-- 社区 Skill 摄取最小链路：来源锁定、许可证检查、SBOM、扫描、重签名。
+- OCI-like Artifact 发布：manifest、runtime payload、assets、evaluation artifacts、SBOM、provenance、签名，本地磁盘保存。
+- 社区 Skill 摄取最小链路：来源 URL、版本、digest 锁定，许可证检查，扫描结果输入，smoke evaluation，Z 公司重签名。
 - Published Skill 不可变版本管理。
 - Agent Profile 发布时生成 Skill Lockfile。
 - Offline Deployment Bundle 导出与客户侧导入。
-- 客户 Local Skill Registry。
-- Customer Controller：Lockfile 校验、验签、撤销检查、只读挂载、热加载通知。
-- Skill Permission Manifest 基础映射：Secret、NetworkPolicy、ServiceAccount/RBAC、volume、securityContext。
+- 客户 Local Skill Registry 的本地模拟导入。
+- Customer Controller 模拟：Lockfile 校验、artifact digest 校验、验签、撤销检查、只读挂载计划、热加载就绪状态。
+- Skill Permission Manifest 基础映射：Secret projection、NetworkPolicy、ServiceAccount/RBAC、volume、securityContext 的 Kubernetes-shaped resource plan。
 - Skill Invocation Trace 本地记录。
-- 离线 Revocation List 导入。
+- 离线 signed Revocation List 导出与导入。
+- Agent Runtime 创建 Skill Draft，且 Draft 必须经 smoke evaluation 和本地发布才能成为 Local Published Skill。
 
 MVP 暂不做：
 
@@ -54,6 +75,7 @@ MVP 暂不做：
 - 所有隔离运行时后端一次性支持完备。
 - 跨客户统计分析。
 - 完整 AI 自动生成 Skill 的安全证明体系。
+- 真实 OCI Registry push/pull、Sigstore/cosign 签名、OPA/Rego admission、K3S CRD/Controller reconcile。
 
 ### 3.2 非目标
 
@@ -114,6 +136,14 @@ MVP 暂不做：
 - Agent Profile 发布：支持兼容性检查、权限汇总、Policy Snapshot 绑定和 Offline Deployment Bundle 导出。
 - 治理审计：支持审批、拒绝、废弃、撤销、签名、导出等操作的审计记录。
 
+MVP 可运行验证版在 ADP 侧先实现以下收敛能力：
+
+- Published Skill 搜索按 namespace、文本 query、visibility、source、runtime mode 过滤。
+- Community Skill 摄取接受已锁定的 source URL、version、digest、license 和 scan 结果，禁止 failed scan、unknown/unlicensed license 和未通过 smoke evaluation 的 Skill 进入发布态。
+- 签名使用本地 HMAC 模拟 Z Signing Service，签名 scope 区分 `z-global` 与 `customer-local`。
+- Offline Bundle 与 Revocation List 都带签名，导入时校验签名与 artifact digest。
+- 所有关键动作写入 AuditEvent，包括 draft.create、draft.evaluate、skill.publish、community.ingest、agent_profile.resolve、offline_bundle.export/import、revocation_list.export/import。
+
 ### 6.2 客户环境侧
 
 - 离线导入：支持导入 Offline Deployment Bundle，并校验 bundle 签名、artifact digest、Policy Snapshot、Revocation List。
@@ -124,6 +154,14 @@ MVP 暂不做：
 - 本地创建：运行中 Agent 可创建 Skill Draft；Draft 经本地评测、Tenant Admin 审批、Offline Signing Component 签名后成为 Local Published Skill。
 - 离线撤销：支持导入 Revocation List 或 emergency revocation bundle，阻止被撤销 Skill 新准入和热加载。
 - 本地观测：客户环境记录 Skill Invocation Trace，并只在客户授权后导出脱敏诊断包。
+
+MVP 可运行验证版在客户侧先实现以下收敛能力：
+
+- Local Skill Registry 用服务本地 state 和 artifacts 目录模拟，导入 Bundle 后可按 digest 读取 Artifact。
+- Controller 不创建真实 K8S 对象，而是输出 `ControllerMountPlan`，其中包含 read-only mount path、hot-load ready 标记和 Kubernetes-shaped permission resources。
+- Runtime invoke 会执行 signature、revocation、digest 所属 Published Skill 检查，然后调用 template/echo payload 并生成 Skill Invocation Trace。
+- Runtime Draft API 只允许具备 `draft_creation.allowed=true` 的请求创建 Draft，服务会把创建者强制标记为 `agent-runtime`，并清除 Draft 继续创建 Draft 的权限。
+- Runtime-created Draft 不能直接执行或挂载，必须先通过 evaluation，再以 `local=true` 发布为 Local Published Skill。
 
 ### 6.3 FDE 工作流
 
@@ -246,6 +284,21 @@ MVP 暂不做：
 - Controller 在准入和热加载时拒绝被撤销版本。
 - 可触发使用该版本的 Agent Pod 滚动重启、降级或停用。
 - 撤销行为有本地审计记录。
+
+### 7.11 MVP 验收矩阵
+
+| 要求 | MVP 验收方式 | 当前实现形态 |
+| --- | --- | --- |
+| FDE 引用已有内部 Skill | `/api/skills` 搜索 Published Skill，Agent Profile resolve 冻结依赖 | 已实现 |
+| FDE 引用社区 Skill | `/api/community/ingestions` 摄取固定社区来源并重签 | 已实现，外部 registry pull 模拟 |
+| FDE 开发并上架内部 Skill | `/api/drafts` 创建、`/evaluate` 评测、`/publish` 发布 | 已实现 |
+| 基于社区 Skill 二次开发 | 摄取后形成 Published Skill，FDE 可把它作为依赖或派生 Draft 来源 | 已实现核心路径 |
+| Agent Profile 声明 Skill 依赖 | `/api/agent-profiles/resolve` 生成 Skill Lockfile | 已实现 |
+| 客户环境离线导入 | `/api/offline-bundles/export` 和 `/api/offline-bundles/import` | 已实现，本地 registry 模拟 |
+| Controller 挂载 Skill 到 Agent Pod | `/api/controller/mount` 输出只读 mount plan 和权限资源映射 | 已实现，真实 K3S 对象 deferred |
+| Agent 运行时动态加载 Skill | `/api/runtime/invoke` 验签、查撤销、执行 payload、记录 trace | 已实现 MVP payload |
+| Agent 运行时自主创建 Skill | `/api/runtime/drafts` 创建受限 Draft | 已实现，仍需评测和 local publish |
+| 客户离线撤销 | `/api/revocations/export` 与 `/api/revocations/import` | 已实现 |
 
 ## 8. 总体架构
 
@@ -437,6 +490,13 @@ stateDiagram-v2
 - 禁止未摄取社区 Skill 被 Agent Profile 或 Local Published Skill 直接依赖。
 - 通过审批后由 Z 公司重签名，成为 Z 信任域内的 Published Skill。
 
+MVP 可运行验证版：
+
+- 摄取请求显式携带 source URL、source version、source digest、license 和 scan result。
+- 服务拒绝 `unknown` / `unlicensed` 许可证、failed scan、critical vulnerability 和未通过 smoke evaluation 的社区 Skill。
+- 摄取通过后直接生成 Draft、运行 smoke evaluation、生成 SBOM/provenance、用 `z-global` scope 重签并发布。
+- FDE 后续可以把该 Published Skill 作为 Agent Profile 依赖，也可以基于该 Published Skill 派生新的内部 Skill Draft。
+
 ### 9.5 Agent Profile Publisher
 
 职责：
@@ -482,7 +542,8 @@ Offline Deployment Bundle 内容：
 
 部署在客户 K3S 环境内。可选实现：
 
-- MVP：Harbor 或 CNCF distribution registry，加上平台自研 metadata adapter。
+- MVP 可运行验证版：服务本地 state 和 artifact 目录模拟 Local Skill Registry。
+- 生产 MVP：Harbor 或 CNCF distribution registry，加上平台自研 metadata adapter。
 - 轻量场景：嵌入式 OCI registry + SQLite metadata。
 - 严格安全场景：Harbor + 私有 CA + 离线漏洞库 + 审计。
 
@@ -556,6 +617,14 @@ status:
   mountedRevision: "7"
 ```
 
+MVP 可运行验证版输出 `ControllerMountPlan`，不直接操作 K3S API。该计划包含：
+
+- Agent Profile identity 和 Policy Snapshot。
+- 每个 Skill 的 id、version、digest、runtime interface、runtime mode。
+- 标准只读挂载路径，如 `/var/lib/adp/skills/{namespace}/{name}/{version}`。
+- `hot_load_ready`，表示该 Skill 已通过本地验签、撤销和 digest 校验。
+- Permission resources：Secret projections、NetworkPolicy resources、ServiceAccount、RBAC rules、volumes、securityContext。
+
 ### 9.9 Agent Runtime and Skill Loader
 
 Agent Runtime 必须实现 Skill Loader：
@@ -565,11 +634,19 @@ Agent Runtime 必须实现 Skill Loader：
 - 加载 Runtime Payload。
 - 按 Skill Runtime Interface 调用。
 - 对每次调用生成 Skill Invocation Trace。
+- 仅允许运行时创建 Skill Draft，不允许绕过评测和签名直接创建 Published Skill。
 - 支持版本切换的 two-phase load：
   1. preload 新版本；
   2. 执行 compatibility 和 smoke check；
   3. 原子切换；
   4. 失败回退旧版本。
+
+MVP 可运行验证版：
+
+- Runtime Payload 支持 `template` 和 `echo` 两种 kind。
+- `/api/runtime/invoke` 代表热加载后的本地调用路径：检查 Published Skill 存在、签名有效、未被撤销，再渲染 payload 并记录 trace。
+- `/api/runtime/drafts` 代表运行中 Agent 创建 Draft 的路径：请求必须声明 `draft_creation.allowed=true`，服务将创建者强制标记为 `agent-runtime`，并清除 Draft 的继续创建权限。
+- Runtime-created Draft 仍然处于 `draft` 状态，必须通过 evaluation 后 `publish?local=true` 才能成为 Local Published Skill。
 
 Skill Runtime Mode：
 
@@ -805,6 +882,8 @@ sequenceDiagram
 
 ### 12.1 Registry API
 
+长期生产 API 采用版本化 `/v1`，草案如下：
+
 ```http
 POST /v1/namespaces/{namespace}/skills
 GET  /v1/namespaces/{namespace}/skills
@@ -817,6 +896,44 @@ POST /v1/agent-profiles/{profile_id}:resolve-skills
 POST /v1/offline-bundles
 GET  /v1/revocations
 ```
+
+MVP 可运行验证版使用简化 HTTP API，便于在单进程服务中演示端到端闭环：
+
+```http
+GET  /
+GET  /api/state
+
+POST /api/drafts
+POST /api/drafts/{namespace}/{name}:{version}/evaluate
+POST /api/drafts/{namespace}/{name}:{version}/publish
+POST /api/drafts/{namespace}/{name}:{version}/publish?local=true
+
+GET  /api/skills
+GET  /api/skills?namespace={namespace}&q={query}&visibility={visibility}&source={source}&runtime_mode={mode}
+GET  /api/skills/{namespace}/{name}:{version}
+
+POST /api/community/ingestions
+POST /api/agent-profiles/resolve
+POST /api/offline-bundles/export
+POST /api/offline-bundles/import
+
+POST /api/controller/mount
+POST /api/runtime/invoke
+POST /api/runtime/drafts
+
+POST /api/revocations
+POST /api/revocations/export
+POST /api/revocations/import
+```
+
+关键请求/响应模型：
+
+- `CreateDraftRequest`：Skill Draft 的 namespace、name、version、runtime payload、dependencies、permission manifest、assets、evaluation。
+- `CommunityIngestRequest`：社区来源 URL、version、digest、license、scan 结果和归一化后的 Skill Draft。
+- `SkillLockfile`：Agent Profile、Policy Snapshot 和 frozen Skill entries。
+- `OfflineBundle`：Lockfile、Policy Snapshot、Published Skills、Artifacts、Revocations、Bundle signature。
+- `ControllerMountPlan`：Agent Profile、Policy Snapshot、mounted skills、read-only mount path、hot-load ready、permission resources。
+- `SignedRevocationList`：schema、id、created_at、revocations、signature。
 
 ### 12.2 Runtime Interface
 
@@ -1058,9 +1175,13 @@ Skill Invocation Trace 字段：
 - `skill_sbom(version_id, format, artifact_ref, digest)`
 - `skill_provenance(version_id, artifact_ref, digest)`
 - `skill_signature(version_id, signature_ref, cert_chain_ref, signer, signed_at)`
-- `community_ingestion(id, source_url, source_version, source_digest, status)`
+- `community_ingestion(id, source_url, source_version, source_digest, license, scan_result, status, published_skill_id)`
 - `agent_profile(id, version, digest, lockfile_ref)`
+- `offline_bundle(id, agent_profile_id, lockfile_ref, policy_snapshot_ref, signature, created_at)`
+- `controller_mount_plan(id, agent_profile_id, policy_snapshot, status, generated_at)`
+- `controller_mounted_skill(plan_id, skill_version_id, digest, mount_path, read_only, hot_load_ready)`
 - `revocation(id, target_type, target_digest, reason, signed_by, effective_at)`
+- `revocation_list(id, signature, created_at, imported_at)`
 - `audit_event(id, actor, action, target, result, created_at)`
 
 客户侧可用轻量模型：
@@ -1070,6 +1191,8 @@ Skill Invocation Trace 字段：
 - `local_signature`
 - `local_revocation`
 - `skill_invocation_trace`
+- `runtime_skill_draft`
+- `permission_resource_plan`
 
 ## 20. 部署拓扑
 
@@ -1099,7 +1222,7 @@ Skill Invocation Trace 字段：
 
 ## 21. 演进路线
 
-### Phase 0：设计与原型，2026-05-09 至 2026-05-13
+### Phase 0：设计与原型
 
 - 完成技术设计评审。
 - 固化术语、ADR、MVP 范围。
@@ -1110,20 +1233,26 @@ Skill Invocation Trace 字段：
 
 - Workbench 创建和发布最小流。
 - Registry metadata 和 OCI Artifact 发布。
-- Z Signing Service 对接。
+- 本地 HMAC 模拟 Z Signing Service，并在接口上保留 signature scope。
 - SBOM/provenance 生成。
 - Skill Lockfile 生成。
 - Offline Bundle 导出和导入。
-- 客户 Local Registry 和 Controller 挂载。
+- Community Skill 最小摄取：来源锁定、license/scan 检查、smoke evaluation、重签。
+- 客户 Local Registry 模拟导入和 Controller Mount Plan。
 - 本地热加载和基础 Skill Invocation Trace。
+- Runtime Agent 创建受限 Skill Draft，评测后可发布为 Local Published Skill。
+- Signed Revocation List 导出和导入。
 
 ### Phase 2：生产安全增强
 
-- 完整社区摄取审批。
+- 接入真实 OCI Registry / ORAS push-pull。
+- 接入 Sigstore/cosign、in-toto attestation 和企业证书链。
+- 完整社区摄取审批、漏洞库、许可证策略和人工 review。
 - Policy Snapshot 与客户侧 admission 完整闭环。
-- Offline Signing Component。
-- Local Published Skill。
-- Revocation List 和 emergency bundle。
+- 真实 K3S CRD/Controller reconcile，物化 NetworkPolicy、RBAC、Secret projection、volume、securityContext。
+- Offline Signing Component 与客户 scoped certificate。
+- Local Published Skill 的 Tenant Admin 审批流。
+- Emergency revocation bundle 和已有 Pod 降级/停用策略。
 - 高风险 Skill sidecar/wasm 隔离。
 
 ### Phase 3：FDE 效果工程
@@ -1155,14 +1284,17 @@ Skill Invocation Trace 字段：
 
 ## 23. 待确认问题
 
-以下问题不阻塞 MVP 设计，但需要在实现前确认：
+以下问题不阻塞 MVP 设计和可运行验证版，但会影响生产落地取舍：
 
-- ADP 首批支持的 Skill 语言 SDK：Python、TypeScript 是否足够。
-- MVP 是否必须内置 Local Workbench，还是先通过 CLI/导入页面审批客户现场 Draft。
+- ADP 首批支持的 Skill 语言 SDK：Python、TypeScript 是否足够，是否需要 Java/Go。
+- Local Workbench 是否进入生产 MVP，还是先通过 CLI/导入页面审批客户现场 Runtime Draft。
 - Offline Signing Component 的密钥载体：HSM、TPM、KMS appliance、sealed secret 哪个作为默认。
 - 客户侧 Local Registry 默认选型：Harbor 还是轻量 distribution registry。
 - Evaluation 的最低发布门槛按风险等级如何量化。
 - Revocation 是否要求自动停用已运行 Pod，还是默认只阻止新加载并提示人工处理。
+- 高风险 Skill 的隔离运行时优先级：sidecar、wasm、microVM 哪个先进入生产 MVP。
+- Community Skill 的许可证白名单、漏洞等级阈值和人工审批 SLA 如何设定。
+- Policy Snapshot 与客户 Controller 的兼容矩阵由平台统一发布，还是随 Offline Bundle 分发。
 
 ## 24. 社区生态参考
 

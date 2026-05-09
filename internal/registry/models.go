@@ -3,12 +3,15 @@ package registry
 import "time"
 
 type State struct {
-	Drafts          map[string]*SkillDraft     `json:"drafts"`
-	Published       map[string]*PublishedSkill `json:"published"`
-	Revocations     map[string]*Revocation     `json:"revocations"`
-	Traces          []SkillInvocationTrace     `json:"traces"`
-	AuditEvents     []AuditEvent               `json:"audit_events"`
-	ImportedBundles map[string]ImportedBundle  `json:"imported_bundles"`
+	Drafts                  map[string]*SkillDraft            `json:"drafts"`
+	Published               map[string]*PublishedSkill        `json:"published"`
+	CommunityIngestions     map[string]*CommunityIngestion    `json:"community_ingestions"`
+	Revocations             map[string]*Revocation            `json:"revocations"`
+	ImportedRevocationLists map[string]ImportedRevocationList `json:"imported_revocation_lists"`
+	MountPlans              map[string]ControllerMountPlan    `json:"mount_plans"`
+	Traces                  []SkillInvocationTrace            `json:"traces"`
+	AuditEvents             []AuditEvent                      `json:"audit_events"`
+	ImportedBundles         map[string]ImportedBundle         `json:"imported_bundles"`
 }
 
 type SkillDraft struct {
@@ -25,7 +28,7 @@ type SkillDraft struct {
 	Dependencies       []SkillDependency  `json:"dependencies"`
 	PermissionManifest PermissionManifest `json:"permission_manifest"`
 	Assets             SkillAssets        `json:"assets"`
-	Evaluation          SkillEvaluation    `json:"evaluation"`
+	Evaluation         SkillEvaluation    `json:"evaluation"`
 	CreatedAt          time.Time          `json:"created_at"`
 	UpdatedAt          time.Time          `json:"updated_at"`
 }
@@ -42,15 +45,15 @@ type CreateDraftRequest struct {
 	Dependencies       []SkillDependency  `json:"dependencies"`
 	PermissionManifest PermissionManifest `json:"permission_manifest"`
 	Assets             SkillAssets        `json:"assets"`
-	Evaluation          SkillEvaluation    `json:"evaluation"`
+	Evaluation         SkillEvaluation    `json:"evaluation"`
 }
 
 type RuntimePayload struct {
-	Mode      string `json:"mode"`
-	Interface string `json:"interface"`
-	Kind      string `json:"kind"`
+	Mode       string `json:"mode"`
+	Interface  string `json:"interface"`
+	Kind       string `json:"kind"`
 	Entrypoint string `json:"entrypoint"`
-	Template  string `json:"template"`
+	Template   string `json:"template"`
 }
 
 type SkillDependency struct {
@@ -118,8 +121,8 @@ type KnowledgeAsset struct {
 }
 
 type SkillEvaluation struct {
-	Cases      []EvaluationCase   `json:"cases"`
-	LastResult *EvaluationResult  `json:"last_result,omitempty"`
+	Cases      []EvaluationCase  `json:"cases"`
+	LastResult *EvaluationResult `json:"last_result,omitempty"`
 }
 
 type EvaluationCase struct {
@@ -129,12 +132,12 @@ type EvaluationCase struct {
 }
 
 type EvaluationResult struct {
-	Passed       bool                 `json:"passed"`
-	Score        float64              `json:"score"`
-	CaseResults  []EvaluationCaseRun  `json:"case_results"`
-	FailureCount int                  `json:"failure_count"`
-	Warnings     []string             `json:"warnings"`
-	RanAt        time.Time            `json:"ran_at"`
+	Passed       bool                `json:"passed"`
+	Score        float64             `json:"score"`
+	CaseResults  []EvaluationCaseRun `json:"case_results"`
+	FailureCount int                 `json:"failure_count"`
+	Warnings     []string            `json:"warnings"`
+	RanAt        time.Time           `json:"ran_at"`
 }
 
 type EvaluationCaseRun struct {
@@ -169,10 +172,49 @@ type PublishedSkill struct {
 	PublishedAt        time.Time          `json:"published_at"`
 }
 
+type SkillSearchFilter struct {
+	Namespace   string `json:"namespace"`
+	Query       string `json:"query"`
+	Visibility  string `json:"visibility"`
+	Source      string `json:"source"`
+	RuntimeMode string `json:"runtime_mode"`
+}
+
+type CommunityIngestRequest struct {
+	SourceURL     string              `json:"source_url"`
+	SourceVersion string              `json:"source_version"`
+	SourceDigest  string              `json:"source_digest"`
+	License       string              `json:"license"`
+	Scan          CommunityScanResult `json:"scan"`
+	Skill         CreateDraftRequest  `json:"skill"`
+}
+
+type CommunityScanResult struct {
+	Status                  string   `json:"status"`
+	CriticalVulnerabilities int      `json:"critical_vulnerabilities"`
+	HighVulnerabilities     int      `json:"high_vulnerabilities"`
+	SensitiveAPIs           []string `json:"sensitive_apis"`
+	Notes                   []string `json:"notes"`
+}
+
+type CommunityIngestion struct {
+	ID               string              `json:"id"`
+	SourceURL        string              `json:"source_url"`
+	SourceVersion    string              `json:"source_version"`
+	SourceDigest     string              `json:"source_digest"`
+	License          string              `json:"license"`
+	Scan             CommunityScanResult `json:"scan"`
+	Status           string              `json:"status"`
+	PublishedSkillID string              `json:"published_skill_id,omitempty"`
+	FailureReason    string              `json:"failure_reason,omitempty"`
+	RequestedAt      time.Time           `json:"requested_at"`
+	CompletedAt      time.Time           `json:"completed_at,omitempty"`
+}
+
 type SBOM struct {
-	Format     string          `json:"format"`
-	Components []SBOMComponent `json:"components"`
-	GeneratedAt time.Time      `json:"generated_at"`
+	Format      string          `json:"format"`
+	Components  []SBOMComponent `json:"components"`
+	GeneratedAt time.Time       `json:"generated_at"`
 }
 
 type SBOMComponent struct {
@@ -200,8 +242,8 @@ type SkillArtifact struct {
 }
 
 type AgentProfileRequest struct {
-	ID      string                  `json:"id"`
-	Version string                  `json:"version"`
+	ID      string                 `json:"id"`
+	Version string                 `json:"version"`
 	Skills  []AgentProfileSkillRef `json:"skills"`
 }
 
@@ -213,9 +255,9 @@ type AgentProfileSkillRef struct {
 type SkillLockfile struct {
 	SchemaVersion  string           `json:"schema_version"`
 	AgentProfile   AgentProfileInfo `json:"agent_profile"`
-	GeneratedAt     time.Time        `json:"generated_at"`
-	PolicySnapshot  string           `json:"policy_snapshot"`
-	Skills          []LockedSkill    `json:"skills"`
+	GeneratedAt    time.Time        `json:"generated_at"`
+	PolicySnapshot string           `json:"policy_snapshot"`
+	Skills         []LockedSkill    `json:"skills"`
 }
 
 type AgentProfileInfo struct {
@@ -239,30 +281,111 @@ type LockedSkill struct {
 }
 
 type OfflineBundle struct {
-	SchemaVersion  string                    `json:"schema_version"`
-	ID             string                    `json:"id"`
-	CreatedAt      time.Time                 `json:"created_at"`
-	Lockfile       SkillLockfile             `json:"lockfile"`
-	PolicySnapshot string                    `json:"policy_snapshot"`
-	Revocations    []Revocation              `json:"revocations"`
-	Skills         []PublishedSkill          `json:"skills"`
-	Artifacts      map[string]SkillArtifact  `json:"artifacts"`
-	Signature      string                    `json:"signature"`
+	SchemaVersion  string                   `json:"schema_version"`
+	ID             string                   `json:"id"`
+	CreatedAt      time.Time                `json:"created_at"`
+	Lockfile       SkillLockfile            `json:"lockfile"`
+	PolicySnapshot string                   `json:"policy_snapshot"`
+	Revocations    []Revocation             `json:"revocations"`
+	Skills         []PublishedSkill         `json:"skills"`
+	Artifacts      map[string]SkillArtifact `json:"artifacts"`
+	Signature      string                   `json:"signature"`
+}
+
+type ControllerMountRequest struct {
+	AgentProfile AgentProfileRequest `json:"agent_profile"`
+	Lockfile     SkillLockfile       `json:"lockfile"`
+}
+
+type ControllerMountPlan struct {
+	SchemaVersion  string           `json:"schema_version"`
+	ID             string           `json:"id"`
+	AgentProfile   AgentProfileInfo `json:"agent_profile"`
+	GeneratedAt    time.Time        `json:"generated_at"`
+	PolicySnapshot string           `json:"policy_snapshot"`
+	Skills         []MountedSkill   `json:"skills"`
+	Status         string           `json:"status"`
+}
+
+type MountedSkill struct {
+	ID                  string              `json:"id"`
+	Version             string              `json:"version"`
+	Digest              string              `json:"digest"`
+	MountPath           string              `json:"mount_path"`
+	ReadOnly            bool                `json:"read_only"`
+	RuntimeInterface    string              `json:"runtime_interface"`
+	RuntimeMode         string              `json:"runtime_mode"`
+	HotLoadReady        bool                `json:"hot_load_ready"`
+	PermissionResources PermissionResources `json:"permission_resources"`
+}
+
+type PermissionResources struct {
+	SecretProjections []SecretProjection      `json:"secret_projections"`
+	NetworkPolicies   []NetworkPolicyResource `json:"network_policies"`
+	ServiceAccount    string                  `json:"service_account"`
+	RBACRules         []RBACRule              `json:"rbac_rules"`
+	Volumes           []VolumeResource        `json:"volumes"`
+	SecurityContext   SecurityContext         `json:"security_context"`
+}
+
+type SecretProjection struct {
+	Name      string `json:"name"`
+	Required  bool   `json:"required"`
+	MountPath string `json:"mount_path"`
+}
+
+type NetworkPolicyResource struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
+	Ports  []int  `json:"ports"`
+}
+
+type RBACRule struct {
+	Resource string   `json:"resource"`
+	Verbs    []string `json:"verbs"`
+	Reason   string   `json:"reason"`
+}
+
+type VolumeResource struct {
+	Name      string   `json:"name"`
+	ReadOnly  bool     `json:"read_only"`
+	Paths     []string `json:"paths"`
+	MountPath string   `json:"mount_path"`
+}
+
+type SecurityContext struct {
+	RunAsNonRoot             bool `json:"run_as_non_root"`
+	ReadOnlyRootFilesystem   bool `json:"read_only_root_filesystem"`
+	AllowPrivilegeEscalation bool `json:"allow_privilege_escalation"`
 }
 
 type ImportedBundle struct {
-	ID        string    `json:"id"`
+	ID         string    `json:"id"`
 	ImportedAt time.Time `json:"imported_at"`
 	SkillCount int       `json:"skill_count"`
 }
 
+type SignedRevocationList struct {
+	SchemaVersion string       `json:"schema_version"`
+	ID            string       `json:"id"`
+	CreatedAt     time.Time    `json:"created_at"`
+	Revocations   []Revocation `json:"revocations"`
+	Signature     string       `json:"signature"`
+}
+
+type ImportedRevocationList struct {
+	ID              string    `json:"id"`
+	ImportedAt      time.Time `json:"imported_at"`
+	RevocationCount int       `json:"revocation_count"`
+}
+
 type Revocation struct {
-	ID          string    `json:"id"`
-	TargetType  string    `json:"target_type"`
+	ID           string    `json:"id"`
+	TargetType   string    `json:"target_type"`
 	TargetDigest string    `json:"target_digest"`
-	Reason      string    `json:"reason"`
-	SignedBy    string    `json:"signed_by"`
-	EffectiveAt time.Time `json:"effective_at"`
+	Reason       string    `json:"reason"`
+	SignedBy     string    `json:"signed_by"`
+	EffectiveAt  time.Time `json:"effective_at"`
 }
 
 type InvokeRequest struct {
@@ -273,24 +396,24 @@ type InvokeRequest struct {
 }
 
 type InvokeResponse struct {
-	Output string                `json:"output"`
-	Trace  SkillInvocationTrace  `json:"trace"`
+	Output string               `json:"output"`
+	Trace  SkillInvocationTrace `json:"trace"`
 }
 
 type SkillInvocationTrace struct {
-	InvocationID       string    `json:"invocation_id"`
-	AgentProfileID     string    `json:"agent_profile_id"`
-	SkillID            string    `json:"skill_id"`
-	SkillVersion       string    `json:"skill_version"`
-	SkillDigest        string    `json:"skill_digest"`
-	RuntimeMode        string    `json:"runtime_mode"`
-	PermissionContext  string    `json:"permission_context_hash"`
-	InputSummary       string    `json:"input_summary_redacted"`
-	OutputSummary      string    `json:"output_summary_redacted"`
-	LatencyMillis      int64     `json:"latency_ms"`
-	ErrorCode          string    `json:"error_code,omitempty"`
-	EvaluationTag      string    `json:"evaluation_tag"`
-	Timestamp          time.Time `json:"timestamp"`
+	InvocationID      string    `json:"invocation_id"`
+	AgentProfileID    string    `json:"agent_profile_id"`
+	SkillID           string    `json:"skill_id"`
+	SkillVersion      string    `json:"skill_version"`
+	SkillDigest       string    `json:"skill_digest"`
+	RuntimeMode       string    `json:"runtime_mode"`
+	PermissionContext string    `json:"permission_context_hash"`
+	InputSummary      string    `json:"input_summary_redacted"`
+	OutputSummary     string    `json:"output_summary_redacted"`
+	LatencyMillis     int64     `json:"latency_ms"`
+	ErrorCode         string    `json:"error_code,omitempty"`
+	EvaluationTag     string    `json:"evaluation_tag"`
+	Timestamp         time.Time `json:"timestamp"`
 }
 
 type AuditEvent struct {
@@ -302,4 +425,3 @@ type AuditEvent struct {
 	Message   string    `json:"message"`
 	CreatedAt time.Time `json:"created_at"`
 }
-

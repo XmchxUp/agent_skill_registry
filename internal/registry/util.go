@@ -30,6 +30,28 @@ func validateDraftRequest(req CreateDraftRequest) error {
 	return nil
 }
 
+func validateCommunityIngestRequest(req CommunityIngestRequest) error {
+	if req.SourceURL == "" || req.SourceVersion == "" || req.SourceDigest == "" {
+		return fmt.Errorf("%w: community source url, version, and digest are required", ErrInvalid)
+	}
+	if req.License == "" {
+		return fmt.Errorf("%w: community license is required", ErrInvalid)
+	}
+	if strings.EqualFold(req.License, "unknown") || strings.EqualFold(req.License, "unlicensed") {
+		return fmt.Errorf("%w: community license is not approved", ErrInvalid)
+	}
+	if req.Scan.Status != "" && req.Scan.Status != "pass" {
+		return fmt.Errorf("%w: community scan must pass before ingestion", ErrInvalid)
+	}
+	if req.Scan.CriticalVulnerabilities > 0 {
+		return fmt.Errorf("%w: community skill has critical vulnerabilities", ErrInvalid)
+	}
+	if req.Skill.Namespace == "" || req.Skill.Name == "" || req.Skill.Version == "" {
+		return fmt.Errorf("%w: normalized skill identity is required", ErrInvalid)
+	}
+	return nil
+}
+
 func validatePolicy(draft *SkillDraft) error {
 	if draft.PermissionManifest.Kubernetes.APIAccess {
 		return fmt.Errorf("%w: Kubernetes API access requires manual elevated-risk policy not supported by MVP", ErrInvalid)
@@ -43,6 +65,83 @@ func validatePolicy(draft *SkillDraft) error {
 		return fmt.Errorf("%w: evaluation must pass", ErrInvalid)
 	}
 	return nil
+}
+
+func mapPermissionResources(skill *PublishedSkill) PermissionResources {
+	pm := skill.PermissionManifest
+	resources := PermissionResources{
+		ServiceAccount: "skill-" + sanitizeKubernetesName(skill.Namespace+"-"+skill.Name),
+		SecurityContext: SecurityContext{
+			RunAsNonRoot:             true,
+			ReadOnlyRootFilesystem:   true,
+			AllowPrivilegeEscalation: false,
+		},
+	}
+	for _, secret := range pm.Secrets {
+		resources.SecretProjections = append(resources.SecretProjections, SecretProjection{
+			Name:      secret.Name,
+			Required:  secret.Required,
+			MountPath: "/var/run/adp/secrets/" + sanitizeKubernetesName(secret.Name),
+		})
+	}
+	for _, egress := range pm.Network.Egress {
+		resources.NetworkPolicies = append(resources.NetworkPolicies, NetworkPolicyResource{
+			Name:   sanitizeKubernetesName(skill.Namespace + "-" + skill.Name + "-" + egress.Name),
+			Target: egress.Target,
+			Ports:  append([]int(nil), egress.Ports...),
+		})
+	}
+	if pm.Kubernetes.APIAccess {
+		resources.RBACRules = append(resources.RBACRules, RBACRule{
+			Resource: "pods",
+			Verbs:    []string{"get", "list"},
+			Reason:   "declared Kubernetes API access",
+		})
+	}
+	if len(pm.Filesystem.Read) > 0 {
+		resources.Volumes = append(resources.Volumes, VolumeResource{
+			Name:      "skill-read-inputs",
+			ReadOnly:  true,
+			Paths:     append([]string(nil), pm.Filesystem.Read...),
+			MountPath: "/mnt/input",
+		})
+	}
+	if len(pm.Filesystem.Write) > 0 {
+		resources.Volumes = append(resources.Volumes, VolumeResource{
+			Name:      "skill-write-workspace",
+			ReadOnly:  false,
+			Paths:     append([]string(nil), pm.Filesystem.Write...),
+			MountPath: "/tmp/adp-skill",
+		})
+	}
+	return resources
+}
+
+func mountPathForSkill(skill *PublishedSkill) string {
+	return "/var/lib/adp/skills/" + skill.Namespace + "/" + skill.Name + "/" + skill.Version
+}
+
+func sanitizeKubernetesName(value string) string {
+	value = strings.ToLower(value)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "skill"
+	}
+	return out
 }
 
 func normalizePayload(payload RuntimePayload) RuntimePayload {
@@ -60,16 +159,16 @@ func runEvaluation(payload RuntimePayload, cases []EvaluationCase) EvaluationRes
 	if len(cases) == 0 {
 		cases = []EvaluationCase{
 			{
-				Name: "default smoke",
-				Input: map[string]string{"text": "smoke"},
+				Name:             "default smoke",
+				Input:            map[string]string{"text": "smoke"},
 				ExpectedContains: []string{"smoke"},
 			},
 		}
 	}
 	result := EvaluationResult{
-		Passed: true,
+		Passed:      true,
 		CaseResults: make([]EvaluationCaseRun, 0, len(cases)),
-		RanAt: time.Now().UTC(),
+		RanAt:       time.Now().UTC(),
 	}
 	for _, testCase := range cases {
 		output, err := renderPayload(payload, testCase.Input)
@@ -136,8 +235,8 @@ func buildSBOM(draft *SkillDraft, now time.Time) SBOM {
 		components = append(components, SBOMComponent{Name: dep.ID, Version: dep.Version, Type: "skill-dependency"})
 	}
 	return SBOM{
-		Format: "CycloneDX-like-MVP",
-		Components: components,
+		Format:      "CycloneDX-like-MVP",
+		Components:  components,
 		GeneratedAt: now,
 	}
 }
@@ -238,3 +337,9 @@ func clonePublished(skill *PublishedSkill) *PublishedSkill {
 	return &copySkill
 }
 
+func cloneCommunityIngestion(ingestion *CommunityIngestion) *CommunityIngestion {
+	data, _ := json.Marshal(ingestion)
+	var copyIngestion CommunityIngestion
+	_ = json.Unmarshal(data, &copyIngestion)
+	return &copyIngestion
+}

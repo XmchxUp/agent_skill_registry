@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	draftStatusDraft     = "draft"
-	draftStatusEvaluated = "evaluated"
-	draftStatusPublished = "published"
-	publishedStatus      = "published"
+	draftStatusDraft         = "draft"
+	draftStatusEvaluated     = "evaluated"
+	draftStatusPublished     = "published"
+	publishedStatus          = "published"
+	ingestionStatusFailed    = "failed"
+	ingestionStatusPublished = "published"
+	mountStatusReady         = "ready"
 )
 
 var (
@@ -29,12 +32,12 @@ var (
 )
 
 type Service struct {
-	mu         sync.Mutex
-	dataDir    string
-	statePath  string
+	mu          sync.Mutex
+	dataDir     string
+	statePath   string
 	artifactDir string
-	signingKey string
-	state      State
+	signingKey  string
+	state       State
 }
 
 func NewService(dataDir, signingKey string) (*Service, error) {
@@ -46,17 +49,20 @@ func NewService(dataDir, signingKey string) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{
-		dataDir: dataDir,
-		statePath: filepath.Join(dataDir, "state.json"),
+		dataDir:     dataDir,
+		statePath:   filepath.Join(dataDir, "state.json"),
 		artifactDir: artifactDir,
-		signingKey: signingKey,
+		signingKey:  signingKey,
 		state: State{
-			Drafts: map[string]*SkillDraft{},
-			Published: map[string]*PublishedSkill{},
-			Revocations: map[string]*Revocation{},
-			Traces: []SkillInvocationTrace{},
-			AuditEvents: []AuditEvent{},
-			ImportedBundles: map[string]ImportedBundle{},
+			Drafts:                  map[string]*SkillDraft{},
+			Published:               map[string]*PublishedSkill{},
+			CommunityIngestions:     map[string]*CommunityIngestion{},
+			Revocations:             map[string]*Revocation{},
+			ImportedRevocationLists: map[string]ImportedRevocationList{},
+			MountPlans:              map[string]ControllerMountPlan{},
+			Traces:                  []SkillInvocationTrace{},
+			AuditEvents:             []AuditEvent{},
+			ImportedBundles:         map[string]ImportedBundle{},
 		},
 	}
 	if err := s.load(); err != nil {
@@ -80,40 +86,109 @@ func (s *Service) CreateDraft(req CreateDraftRequest) (*SkillDraft, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := validateDraftRequest(req); err != nil {
+	draft, err := s.createDraftLocked(req)
+	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
-	draft := &SkillDraft{
-		ID: idFor(req.Namespace, req.Name, req.Version),
-		Namespace: req.Namespace,
-		Name: req.Name,
-		Version: req.Version,
-		Description: req.Description,
-		Visibility: defaultString(req.Visibility, "project-private"),
-		Source: defaultString(req.Source, "internal"),
-		Status: draftStatusDraft,
-		CreatedBy: defaultString(req.CreatedBy, "fde"),
-		RuntimePayload: normalizePayload(req.RuntimePayload),
-		Dependencies: req.Dependencies,
-		PermissionManifest: req.PermissionManifest,
-		Assets: req.Assets,
-		Evaluation: req.Evaluation,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	if _, ok := s.state.Drafts[draft.ID]; ok {
-		return nil, fmt.Errorf("%w: draft already exists", ErrConflict)
-	}
-	if _, ok := s.state.Published[draft.ID]; ok {
-		return nil, fmt.Errorf("%w: published skill already exists", ErrConflict)
-	}
-	s.state.Drafts[draft.ID] = draft
 	s.audit("fde", "draft.create", draft.ID, "ok", "created skill draft")
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
 	return cloneDraft(draft), nil
+}
+
+func (s *Service) CreateRuntimeDraft(req CreateDraftRequest) (*SkillDraft, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !req.PermissionManifest.DraftCreation.Allowed {
+		return nil, fmt.Errorf("%w: runtime draft creation permission is required", ErrInvalid)
+	}
+	req.Source = "runtime-agent"
+	req.CreatedBy = "agent-runtime"
+	req.PermissionManifest.DraftCreation.Allowed = false
+	draft, err := s.createDraftLocked(req)
+	if err != nil {
+		return nil, err
+	}
+	s.audit("runtime", "draft.create", draft.ID, "ok", "runtime-created Skill Draft")
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return cloneDraft(draft), nil
+}
+
+func (s *Service) IngestCommunitySkill(req CommunityIngestRequest) (*CommunityIngestion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	ingestion := &CommunityIngestion{
+		ID:            "ing-" + hashString(req.SourceURL + ":" + req.SourceVersion + ":" + req.SourceDigest)[:12],
+		SourceURL:     req.SourceURL,
+		SourceVersion: req.SourceVersion,
+		SourceDigest:  req.SourceDigest,
+		License:       req.License,
+		Scan:          req.Scan,
+		Status:        ingestionStatusFailed,
+		RequestedAt:   now,
+	}
+	if s.state.CommunityIngestions == nil {
+		s.state.CommunityIngestions = map[string]*CommunityIngestion{}
+	}
+	if _, ok := s.state.CommunityIngestions[ingestion.ID]; ok {
+		return nil, fmt.Errorf("%w: community ingestion already exists", ErrConflict)
+	}
+	if err := validateCommunityIngestRequest(req); err != nil {
+		ingestion.FailureReason = err.Error()
+		s.state.CommunityIngestions[ingestion.ID] = ingestion
+		s.audit("community-ingestion", "community.ingest", ingestion.ID, "deny", err.Error())
+		_ = s.saveLocked()
+		return cloneCommunityIngestion(ingestion), err
+	}
+
+	draftReq := req.Skill
+	draftReq.Source = fmt.Sprintf("community:%s@%s#%s", req.SourceURL, req.SourceVersion, req.SourceDigest)
+	draftReq.CreatedBy = defaultString(draftReq.CreatedBy, "community-ingestion")
+	if draftReq.Visibility == "" {
+		draftReq.Visibility = "company-wide"
+	}
+	draft, err := s.createDraftLocked(draftReq)
+	if err != nil {
+		ingestion.FailureReason = err.Error()
+		s.state.CommunityIngestions[ingestion.ID] = ingestion
+		s.audit("community-ingestion", "community.ingest", ingestion.ID, "deny", err.Error())
+		_ = s.saveLocked()
+		return cloneCommunityIngestion(ingestion), err
+	}
+	result := runEvaluation(draft.RuntimePayload, draft.Evaluation.Cases)
+	draft.Evaluation.LastResult = &result
+	draft.Status = draftStatusEvaluated
+	draft.UpdatedAt = time.Now().UTC()
+	if !result.Passed {
+		ingestion.FailureReason = "community skill smoke evaluation failed"
+		s.state.CommunityIngestions[ingestion.ID] = ingestion
+		s.audit("community-ingestion", "community.ingest", ingestion.ID, "deny", ingestion.FailureReason)
+		_ = s.saveLocked()
+		return cloneCommunityIngestion(ingestion), fmt.Errorf("%w: %s", ErrInvalid, ingestion.FailureReason)
+	}
+	published, err := s.publishDraftLocked(draft.ID, false)
+	if err != nil {
+		ingestion.FailureReason = err.Error()
+		s.state.CommunityIngestions[ingestion.ID] = ingestion
+		s.audit("community-ingestion", "community.ingest", ingestion.ID, "deny", err.Error())
+		_ = s.saveLocked()
+		return cloneCommunityIngestion(ingestion), err
+	}
+	ingestion.Status = ingestionStatusPublished
+	ingestion.PublishedSkillID = published.ID
+	ingestion.CompletedAt = time.Now().UTC()
+	s.state.CommunityIngestions[ingestion.ID] = ingestion
+	s.audit("community-ingestion", "community.ingest", ingestion.ID, "ok", published.ID)
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return cloneCommunityIngestion(ingestion), nil
 }
 
 func (s *Service) EvaluateDraft(id string) (*EvaluationResult, error) {
@@ -139,6 +214,18 @@ func (s *Service) PublishDraft(id string, local bool) (*PublishedSkill, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	published, err := s.publishDraftLocked(id, local)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return clonePublished(published), nil
+}
+
+func (s *Service) publishDraftLocked(id string, local bool) (*PublishedSkill, error) {
+
 	draft, ok := s.state.Drafts[id]
 	if !ok {
 		return nil, ErrNotFound
@@ -157,38 +244,38 @@ func (s *Service) PublishDraft(id string, local bool) (*PublishedSkill, error) {
 	sbom := buildSBOM(draft, now)
 	provenance := Provenance{
 		PredicateType: "https://slsa.dev/provenance/v1",
-		Builder: "agent-skill-registry-mvp",
-		Source: draft.Source,
-		Materials: dependencyIDs(draft.Dependencies),
-		BuiltAt: now,
+		Builder:       "agent-skill-registry-mvp",
+		Source:        draft.Source,
+		Materials:     dependencyIDs(draft.Dependencies),
+		BuiltAt:       now,
 	}
 	published := PublishedSkill{
-		ID: draft.ID,
-		Namespace: draft.Namespace,
-		Name: draft.Name,
-		Version: draft.Version,
-		Description: draft.Description,
-		Visibility: draft.Visibility,
-		Source: draft.Source,
-		Status: publishedStatus,
-		Local: local,
-		RuntimePayload: draft.RuntimePayload,
-		Dependencies: draft.Dependencies,
+		ID:                 draft.ID,
+		Namespace:          draft.Namespace,
+		Name:               draft.Name,
+		Version:            draft.Version,
+		Description:        draft.Description,
+		Visibility:         draft.Visibility,
+		Source:             draft.Source,
+		Status:             publishedStatus,
+		Local:              local,
+		RuntimePayload:     draft.RuntimePayload,
+		Dependencies:       draft.Dependencies,
 		PermissionManifest: stripSecretValues(draft.PermissionManifest),
-		Assets: draft.Assets,
-		EvaluationResult: *draft.Evaluation.LastResult,
-		SBOM: sbom,
-		Provenance: provenance,
-		PublishedAt: now,
+		Assets:             draft.Assets,
+		EvaluationResult:   *draft.Evaluation.LastResult,
+		SBOM:               sbom,
+		Provenance:         provenance,
+		PublishedAt:        now,
 	}
 	artifact := SkillArtifact{
-		MediaType: "application/vnd.oci.image.manifest.v1+json",
-		ArtifactType: "application/vnd.z.adp.skill.v1+json",
-		SchemaVersion: "adp.skill.artifact/v1",
-		Skill: published,
+		MediaType:          "application/vnd.oci.image.manifest.v1+json",
+		ArtifactType:       "application/vnd.z.adp.skill.v1+json",
+		SchemaVersion:      "adp.skill.artifact/v1",
+		Skill:              published,
 		PermissionManifest: published.PermissionManifest,
-		SBOM: sbom,
-		Provenance: provenance,
+		SBOM:               sbom,
+		Provenance:         provenance,
 	}
 	digest, err := digestJSON(artifact)
 	if err != nil {
@@ -211,18 +298,38 @@ func (s *Service) PublishDraft(id string, local bool) (*PublishedSkill, error) {
 	draft.UpdatedAt = now
 	s.state.Published[published.ID] = &published
 	s.audit("platform", "skill.publish", id, "ok", published.SignatureScope)
-	if err := s.saveLocked(); err != nil {
-		return nil, err
-	}
 	return clonePublished(&published), nil
 }
 
 func (s *Service) ListPublished() []PublishedSkill {
+	return s.SearchPublished(SkillSearchFilter{})
+}
+
+func (s *Service) SearchPublished(filter SkillSearchFilter) []PublishedSkill {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	items := make([]PublishedSkill, 0, len(s.state.Published))
 	for _, skill := range s.state.Published {
+		if filter.Namespace != "" && skill.Namespace != filter.Namespace {
+			continue
+		}
+		if filter.Visibility != "" && skill.Visibility != filter.Visibility {
+			continue
+		}
+		if filter.Source != "" && !strings.Contains(skill.Source, filter.Source) {
+			continue
+		}
+		if filter.RuntimeMode != "" && skill.RuntimePayload.Mode != filter.RuntimeMode {
+			continue
+		}
+		if filter.Query != "" {
+			q := strings.ToLower(filter.Query)
+			haystack := strings.ToLower(skill.ID + " " + skill.Description + " " + strings.Join(skill.PermissionManifest.DataDomains, " "))
+			if !strings.Contains(haystack, q) {
+				continue
+			}
+		}
 		items = append(items, *clonePublished(skill))
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -287,14 +394,14 @@ func (s *Service) ExportBundle(req AgentProfileRequest) (*OfflineBundle, error) 
 		return revocations[i].ID < revocations[j].ID
 	})
 	bundle := &OfflineBundle{
-		SchemaVersion: "adp.offline_bundle/v1",
-		ID: "bundle-" + hashString(req.ID+":"+req.Version+":"+time.Now().UTC().Format(time.RFC3339Nano))[:12],
-		CreatedAt: time.Now().UTC(),
-		Lockfile: *lock,
+		SchemaVersion:  "adp.offline_bundle/v1",
+		ID:             "bundle-" + hashString(req.ID + ":" + req.Version + ":" + time.Now().UTC().Format(time.RFC3339Nano))[:12],
+		CreatedAt:      time.Now().UTC(),
+		Lockfile:       *lock,
 		PolicySnapshot: lock.PolicySnapshot,
-		Revocations: revocations,
-		Skills: skills,
-		Artifacts: artifacts,
+		Revocations:    revocations,
+		Skills:         skills,
+		Artifacts:      artifacts,
 	}
 	digest, err := digestJSON(bundleForSigning(*bundle))
 	if err != nil {
@@ -341,7 +448,7 @@ func (s *Service) ImportBundle(bundle OfflineBundle) (*ImportedBundle, error) {
 		s.state.Revocations[rev.ID] = &revCopy
 	}
 	imported := ImportedBundle{
-		ID: bundle.ID,
+		ID:         bundle.ID,
 		ImportedAt: time.Now().UTC(),
 		SkillCount: len(bundle.Skills),
 	}
@@ -351,6 +458,78 @@ func (s *Service) ImportBundle(bundle OfflineBundle) (*ImportedBundle, error) {
 		return nil, err
 	}
 	return &imported, nil
+}
+
+func (s *Service) PrepareControllerMount(req ControllerMountRequest) (*ControllerMountPlan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	lock := req.Lockfile
+	if lock.SchemaVersion == "" {
+		resolved, err := s.resolveLockfileLocked(req.AgentProfile)
+		if err != nil {
+			return nil, err
+		}
+		lock = *resolved
+	}
+	if lock.SchemaVersion != "adp.skill.lock/v1" {
+		return nil, fmt.Errorf("%w: unsupported lockfile schema", ErrInvalid)
+	}
+	if lock.PolicySnapshot == "" {
+		return nil, fmt.Errorf("%w: policy snapshot is required", ErrInvalid)
+	}
+	mounted := make([]MountedSkill, 0, len(lock.Skills))
+	for _, locked := range lock.Skills {
+		skill, ok := s.state.Published[locked.ID]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, locked.ID)
+		}
+		if skill.Version != locked.Version || skill.Digest != locked.Digest {
+			return nil, fmt.Errorf("%w: lockfile digest mismatch for %s", ErrInvalid, locked.ID)
+		}
+		if s.isRevokedLocked(skill.Digest) {
+			return nil, fmt.Errorf("%w: skill %s is revoked", ErrInvalid, locked.ID)
+		}
+		if !s.verify(skill.Digest+":"+skill.SignatureScope, skill.Signature) {
+			return nil, fmt.Errorf("%w: skill signature verification failed", ErrInvalid)
+		}
+		artifact, err := s.readArtifactLocked(skill.Digest)
+		if err != nil {
+			return nil, err
+		}
+		if err := verifyArtifact(*skill, artifact, s); err != nil {
+			return nil, err
+		}
+		mounted = append(mounted, MountedSkill{
+			ID:                  skill.ID,
+			Version:             skill.Version,
+			Digest:              skill.Digest,
+			MountPath:           mountPathForSkill(skill),
+			ReadOnly:            true,
+			RuntimeInterface:    skill.RuntimePayload.Interface,
+			RuntimeMode:         skill.RuntimePayload.Mode,
+			HotLoadReady:        true,
+			PermissionResources: mapPermissionResources(skill),
+		})
+	}
+	plan := ControllerMountPlan{
+		SchemaVersion:  "adp.controller_mount_plan/v1",
+		ID:             "mount-" + hashString(lock.AgentProfile.ID + ":" + lock.AgentProfile.Version + ":" + time.Now().UTC().Format(time.RFC3339Nano))[:12],
+		AgentProfile:   lock.AgentProfile,
+		GeneratedAt:    time.Now().UTC(),
+		PolicySnapshot: lock.PolicySnapshot,
+		Skills:         mounted,
+		Status:         mountStatusReady,
+	}
+	if s.state.MountPlans == nil {
+		s.state.MountPlans = map[string]ControllerMountPlan{}
+	}
+	s.state.MountPlans[plan.ID] = plan
+	s.audit("controller", "agent_profile.mount", lock.AgentProfile.ID+":"+lock.AgentProfile.Version, "ok", fmt.Sprintf("%d skills", len(mounted)))
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return &plan, nil
 }
 
 func (s *Service) Invoke(req InvokeRequest) (*InvokeResponse, error) {
@@ -377,18 +556,18 @@ func (s *Service) Invoke(req InvokeRequest) (*InvokeResponse, error) {
 	start := time.Now()
 	output, err := renderPayload(skill.RuntimePayload, req.Input)
 	trace := SkillInvocationTrace{
-		InvocationID: "inv-" + hashString(time.Now().UTC().Format(time.RFC3339Nano)+skill.ID)[:12],
-		AgentProfileID: defaultString(req.AgentProfileID, "local-agent"),
-		SkillID: skill.ID,
-		SkillVersion: skill.Version,
-		SkillDigest: skill.Digest,
-		RuntimeMode: skill.RuntimePayload.Mode,
+		InvocationID:      "inv-" + hashString(time.Now().UTC().Format(time.RFC3339Nano) + skill.ID)[:12],
+		AgentProfileID:    defaultString(req.AgentProfileID, "local-agent"),
+		SkillID:           skill.ID,
+		SkillVersion:      skill.Version,
+		SkillDigest:       skill.Digest,
+		RuntimeMode:       skill.RuntimePayload.Mode,
 		PermissionContext: hashPermission(skill.PermissionManifest),
-		InputSummary: summarizeMap(req.Input),
-		OutputSummary: summarizeString(output),
-		LatencyMillis: time.Since(start).Milliseconds(),
-		EvaluationTag: "runtime",
-		Timestamp: time.Now().UTC(),
+		InputSummary:      summarizeMap(req.Input),
+		OutputSummary:     summarizeString(output),
+		LatencyMillis:     time.Since(start).Milliseconds(),
+		EvaluationTag:     "runtime",
+		Timestamp:         time.Now().UTC(),
 	}
 	if err != nil {
 		trace.ErrorCode = "INVOKE_FAILED"
@@ -410,22 +589,96 @@ func (s *Service) Revoke(targetDigest, reason string) (*Revocation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	rev, err := s.revokeLocked(targetDigest, reason)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return rev, nil
+}
+
+func (s *Service) ExportRevocationList() (*SignedRevocationList, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	revocations := make([]Revocation, 0, len(s.state.Revocations))
+	for _, rev := range s.state.Revocations {
+		revocations = append(revocations, *rev)
+	}
+	sort.Slice(revocations, func(i, j int) bool {
+		return revocations[i].ID < revocations[j].ID
+	})
+	list := &SignedRevocationList{
+		SchemaVersion: "adp.revocation_list/v1",
+		ID:            "revlist-" + hashString(time.Now().UTC().Format(time.RFC3339Nano))[:12],
+		CreatedAt:     time.Now().UTC(),
+		Revocations:   revocations,
+	}
+	digest, err := digestJSON(revocationListForSigning(*list))
+	if err != nil {
+		return nil, err
+	}
+	list.Signature = s.sign(digest + ":revocation-list")
+	s.audit("security", "revocation_list.export", list.ID, "ok", fmt.Sprintf("%d revocations", len(revocations)))
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (s *Service) ImportRevocationList(list SignedRevocationList) (*ImportedRevocationList, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if list.SchemaVersion != "adp.revocation_list/v1" || list.ID == "" {
+		return nil, fmt.Errorf("%w: invalid revocation list", ErrInvalid)
+	}
+	digest, err := digestJSON(revocationListForSigning(list))
+	if err != nil {
+		return nil, err
+	}
+	if !s.verify(digest+":revocation-list", list.Signature) {
+		return nil, fmt.Errorf("%w: revocation list signature verification failed", ErrInvalid)
+	}
+	for _, rev := range list.Revocations {
+		if rev.ID == "" || rev.TargetDigest == "" {
+			return nil, fmt.Errorf("%w: revocation entries require id and target_digest", ErrInvalid)
+		}
+		revCopy := rev
+		s.state.Revocations[rev.ID] = &revCopy
+	}
+	if s.state.ImportedRevocationLists == nil {
+		s.state.ImportedRevocationLists = map[string]ImportedRevocationList{}
+	}
+	imported := ImportedRevocationList{
+		ID:              list.ID,
+		ImportedAt:      time.Now().UTC(),
+		RevocationCount: len(list.Revocations),
+	}
+	s.state.ImportedRevocationLists[list.ID] = imported
+	s.audit("tenant-admin", "revocation_list.import", list.ID, "ok", fmt.Sprintf("%d revocations", len(list.Revocations)))
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return &imported, nil
+}
+
+func (s *Service) revokeLocked(targetDigest, reason string) (*Revocation, error) {
 	if targetDigest == "" {
 		return nil, fmt.Errorf("%w: target_digest is required", ErrInvalid)
 	}
 	rev := &Revocation{
-		ID: "rev-" + hashString(targetDigest+":"+time.Now().UTC().Format(time.RFC3339Nano))[:12],
-		TargetType: "skill_digest",
+		ID:           "rev-" + hashString(targetDigest + ":" + time.Now().UTC().Format(time.RFC3339Nano))[:12],
+		TargetType:   "skill_digest",
 		TargetDigest: targetDigest,
-		Reason: defaultString(reason, "manual revocation"),
-		SignedBy: "z-root-dev",
-		EffectiveAt: time.Now().UTC(),
+		Reason:       defaultString(reason, "manual revocation"),
+		SignedBy:     "z-root-dev",
+		EffectiveAt:  time.Now().UTC(),
 	}
 	s.state.Revocations[rev.ID] = rev
 	s.audit("security", "skill.revoke", targetDigest, "ok", rev.Reason)
-	if err := s.saveLocked(); err != nil {
-		return nil, err
-	}
 	return rev, nil
 }
 
@@ -468,17 +721,17 @@ func (s *Service) resolveLockfileLocked(req AgentProfileRequest) (*SkillLockfile
 		}
 		seen[id] = true
 		locked = append(locked, LockedSkill{
-			ID: skill.ID,
-			Version: skill.Version,
-			Artifact: skill.ArtifactRef,
-			Digest: skill.Digest,
-			Signature: skill.Signature,
-			SignatureKeyID: skill.SignatureKeyID,
-			RuntimeInterface: skill.RuntimePayload.Interface,
-			RuntimeMode: skill.RuntimePayload.Mode,
+			ID:                 skill.ID,
+			Version:            skill.Version,
+			Artifact:           skill.ArtifactRef,
+			Digest:             skill.Digest,
+			Signature:          skill.Signature,
+			SignatureKeyID:     skill.SignatureKeyID,
+			RuntimeInterface:   skill.RuntimePayload.Interface,
+			RuntimeMode:        skill.RuntimePayload.Mode,
 			PermissionManifest: hashPermission(skill.PermissionManifest),
-			SBOM: hashAny(skill.SBOM),
-			Provenance: hashAny(skill.Provenance),
+			SBOM:               hashAny(skill.SBOM),
+			Provenance:         hashAny(skill.Provenance),
 		})
 		return nil
 	}
@@ -494,13 +747,13 @@ func (s *Service) resolveLockfileLocked(req AgentProfileRequest) (*SkillLockfile
 	return &SkillLockfile{
 		SchemaVersion: "adp.skill.lock/v1",
 		AgentProfile: AgentProfileInfo{
-			ID: req.ID,
+			ID:      req.ID,
 			Version: req.Version,
-			Digest: "sha256:" + profileDigest,
+			Digest:  "sha256:" + profileDigest,
 		},
-		GeneratedAt: time.Now().UTC(),
+		GeneratedAt:    time.Now().UTC(),
 		PolicySnapshot: "policy-mvp@sha256:" + hashString("policy-mvp-v1"),
-		Skills: locked,
+		Skills:         locked,
 	}, nil
 }
 
@@ -543,8 +796,17 @@ func (s *Service) load() error {
 	if s.state.Published == nil {
 		s.state.Published = map[string]*PublishedSkill{}
 	}
+	if s.state.CommunityIngestions == nil {
+		s.state.CommunityIngestions = map[string]*CommunityIngestion{}
+	}
 	if s.state.Revocations == nil {
 		s.state.Revocations = map[string]*Revocation{}
+	}
+	if s.state.ImportedRevocationLists == nil {
+		s.state.ImportedRevocationLists = map[string]ImportedRevocationList{}
+	}
+	if s.state.MountPlans == nil {
+		s.state.MountPlans = map[string]ControllerMountPlan{}
 	}
 	if s.state.ImportedBundles == nil {
 		s.state.ImportedBundles = map[string]ImportedBundle{}
@@ -588,36 +850,69 @@ func (s *Service) readArtifactLocked(digest string) (SkillArtifact, error) {
 
 func (s *Service) audit(actor, action, target, result, message string) {
 	s.state.AuditEvents = append(s.state.AuditEvents, AuditEvent{
-		ID: "aud-" + hashString(actor+action+target+time.Now().UTC().Format(time.RFC3339Nano))[:12],
-		Actor: actor,
-		Action: action,
-		Target: target,
-		Result: result,
-		Message: message,
+		ID:        "aud-" + hashString(actor + action + target + time.Now().UTC().Format(time.RFC3339Nano))[:12],
+		Actor:     actor,
+		Action:    action,
+		Target:    target,
+		Result:    result,
+		Message:   message,
 		CreatedAt: time.Now().UTC(),
 	})
 }
 
+func (s *Service) createDraftLocked(req CreateDraftRequest) (*SkillDraft, error) {
+	if err := validateDraftRequest(req); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	draft := &SkillDraft{
+		ID:                 idFor(req.Namespace, req.Name, req.Version),
+		Namespace:          req.Namespace,
+		Name:               req.Name,
+		Version:            req.Version,
+		Description:        req.Description,
+		Visibility:         defaultString(req.Visibility, "project-private"),
+		Source:             defaultString(req.Source, "internal"),
+		Status:             draftStatusDraft,
+		CreatedBy:          defaultString(req.CreatedBy, "fde"),
+		RuntimePayload:     normalizePayload(req.RuntimePayload),
+		Dependencies:       req.Dependencies,
+		PermissionManifest: req.PermissionManifest,
+		Assets:             req.Assets,
+		Evaluation:         req.Evaluation,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if _, ok := s.state.Drafts[draft.ID]; ok {
+		return nil, fmt.Errorf("%w: draft already exists", ErrConflict)
+	}
+	if _, ok := s.state.Published[draft.ID]; ok {
+		return nil, fmt.Errorf("%w: published skill already exists", ErrConflict)
+	}
+	s.state.Drafts[draft.ID] = draft
+	return draft, nil
+}
+
 func (s *Service) seed() error {
 	req := CreateDraftRequest{
-		Namespace: "common",
-		Name: "echo-template",
-		Version: "1.0.0",
+		Namespace:   "common",
+		Name:        "echo-template",
+		Version:     "1.0.0",
 		Description: "Template Skill that renders input text for MVP smoke tests.",
-		Visibility: "company-wide",
-		Source: "internal-seed",
-		CreatedBy: "platform",
+		Visibility:  "company-wide",
+		Source:      "internal-seed",
+		CreatedBy:   "platform",
 		RuntimePayload: RuntimePayload{
-			Mode: "in_process",
-			Interface: "adp.skill.runtime/v1",
-			Kind: "template",
+			Mode:       "in_process",
+			Interface:  "adp.skill.runtime/v1",
+			Kind:       "template",
 			Entrypoint: "runtime/template",
-			Template: "Processed {{text}}",
+			Template:   "Processed {{text}}",
 		},
 		PermissionManifest: PermissionManifest{
 			DataDomains: []string{"demo"},
-			Filesystem: FilePermission{Read: []string{"/mnt/input"}, Write: []string{"/tmp/adp-skill"}},
-			Kubernetes: KubernetesAccess{APIAccess: false},
+			Filesystem:  FilePermission{Read: []string{"/mnt/input"}, Write: []string{"/tmp/adp-skill"}},
+			Kubernetes:  KubernetesAccess{APIAccess: false},
 		},
 		Assets: SkillAssets{
 			Examples: []string{"text=invoice-123"},
@@ -625,8 +920,8 @@ func (s *Service) seed() error {
 		Evaluation: SkillEvaluation{
 			Cases: []EvaluationCase{
 				{
-					Name: "echo smoke",
-					Input: map[string]string{"text": "invoice-123"},
+					Name:             "echo smoke",
+					Input:            map[string]string{"text": "invoice-123"},
 					ExpectedContains: []string{"Processed", "invoice-123"},
 				},
 			},
@@ -649,21 +944,21 @@ func (s *Service) createDraftSeed(req CreateDraftRequest) (*SkillDraft, error) {
 	}
 	now := time.Now().UTC()
 	draft := &SkillDraft{
-		ID: idFor(req.Namespace, req.Name, req.Version),
-		Namespace: req.Namespace,
-		Name: req.Name,
-		Version: req.Version,
-		Description: req.Description,
-		Visibility: req.Visibility,
-		Source: req.Source,
-		Status: draftStatusDraft,
-		CreatedBy: req.CreatedBy,
-		RuntimePayload: normalizePayload(req.RuntimePayload),
+		ID:                 idFor(req.Namespace, req.Name, req.Version),
+		Namespace:          req.Namespace,
+		Name:               req.Name,
+		Version:            req.Version,
+		Description:        req.Description,
+		Visibility:         req.Visibility,
+		Source:             req.Source,
+		Status:             draftStatusDraft,
+		CreatedBy:          req.CreatedBy,
+		RuntimePayload:     normalizePayload(req.RuntimePayload),
 		PermissionManifest: req.PermissionManifest,
-		Assets: req.Assets,
-		Evaluation: req.Evaluation,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Assets:             req.Assets,
+		Evaluation:         req.Evaluation,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	s.state.Drafts[draft.ID] = draft
 	return draft, nil
@@ -675,35 +970,35 @@ func (s *Service) publishDraftSeed(id string) (*PublishedSkill, error) {
 	sbom := buildSBOM(draft, now)
 	provenance := Provenance{
 		PredicateType: "https://slsa.dev/provenance/v1",
-		Builder: "agent-skill-registry-mvp",
-		Source: draft.Source,
-		BuiltAt: now,
+		Builder:       "agent-skill-registry-mvp",
+		Source:        draft.Source,
+		BuiltAt:       now,
 	}
 	published := PublishedSkill{
-		ID: draft.ID,
-		Namespace: draft.Namespace,
-		Name: draft.Name,
-		Version: draft.Version,
-		Description: draft.Description,
-		Visibility: draft.Visibility,
-		Source: draft.Source,
-		Status: publishedStatus,
-		RuntimePayload: draft.RuntimePayload,
+		ID:                 draft.ID,
+		Namespace:          draft.Namespace,
+		Name:               draft.Name,
+		Version:            draft.Version,
+		Description:        draft.Description,
+		Visibility:         draft.Visibility,
+		Source:             draft.Source,
+		Status:             publishedStatus,
+		RuntimePayload:     draft.RuntimePayload,
 		PermissionManifest: stripSecretValues(draft.PermissionManifest),
-		Assets: draft.Assets,
-		EvaluationResult: *draft.Evaluation.LastResult,
-		SBOM: sbom,
-		Provenance: provenance,
-		PublishedAt: now,
+		Assets:             draft.Assets,
+		EvaluationResult:   *draft.Evaluation.LastResult,
+		SBOM:               sbom,
+		Provenance:         provenance,
+		PublishedAt:        now,
 	}
 	artifact := SkillArtifact{
-		MediaType: "application/vnd.oci.image.manifest.v1+json",
-		ArtifactType: "application/vnd.z.adp.skill.v1+json",
-		SchemaVersion: "adp.skill.artifact/v1",
-		Skill: published,
+		MediaType:          "application/vnd.oci.image.manifest.v1+json",
+		ArtifactType:       "application/vnd.z.adp.skill.v1+json",
+		SchemaVersion:      "adp.skill.artifact/v1",
+		Skill:              published,
 		PermissionManifest: published.PermissionManifest,
-		SBOM: sbom,
-		Provenance: provenance,
+		SBOM:               sbom,
+		Provenance:         provenance,
 	}
 	digest, err := digestJSON(artifact)
 	if err != nil {
@@ -747,4 +1042,10 @@ func bundleForSigning(bundle OfflineBundle) OfflineBundle {
 	copyBundle := bundle
 	copyBundle.Signature = ""
 	return copyBundle
+}
+
+func revocationListForSigning(list SignedRevocationList) SignedRevocationList {
+	copyList := list
+	copyList.Signature = ""
+	return copyList
 }
