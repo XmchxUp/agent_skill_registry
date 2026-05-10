@@ -2,6 +2,8 @@
 
 Agent Skill Registry is a runnable MVP for the ADP Skill supply-chain loop described in `docs/agent-skill-registry-design.md`.
 
+The design document now treats the registry as part of a broader Agent Skill Infrastructure Platform: an ADP Skill Control Plane plus a customer K3S Skill Data Plane with OCI artifact distribution, air-gapped import, Agent Skill Operator reconciliation, Skill Cache, Skill Loader, Skill Sidecar Runtime, and semantic Skill retrieval. This repository's Go service remains the small vertical slice that validates the governed supply-chain workflow.
+
 It is intentionally small and dependency-free so it can run in an offline development environment. The implementation is not a production registry yet; it is a vertical slice that validates the core workflow.
 
 ## What Works
@@ -287,6 +289,8 @@ curl -s -X POST http://localhost:18080/api/revocations/import \
 - Signatures use HMAC for local demonstration, not Sigstore/cosign.
 - Runtime execution supports template and echo payloads only.
 - Controller and K3S integration are modeled as a deterministic mount plan, not applied to a real cluster.
+- Agent Skill Operator, CRDs, Skill Cache, CSI/volume injection, and Sidecar Runtime are design-level production targets, not implemented Kubernetes controllers in this MVP.
+- Semantic Skill Retrieval and Progressive Skill Disclosure are design-level production targets; MVP search is metadata filtering only.
 - Policy evaluation is built-in Go logic, not OPA/Rego yet.
 - Community Skill ingestion uses supplied source/scan/license metadata; it does not pull from a real external registry.
 - Permission mapping emits Kubernetes-shaped resources but does not create NetworkPolicy, ServiceAccount, RBAC, projected Secret, volume, or securityContext objects in K3S.

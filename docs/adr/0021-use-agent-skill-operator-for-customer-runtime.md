@@ -1,0 +1,3 @@
+# Use an Agent Skill Operator for customer runtime
+
+Customer K3S environments reconcile Agent Profiles through an Agent Skill Operator rather than an ad hoc startup script or application-side pull logic. The Operator watches AgentProfile and SkillSet resources, verifies Skill Lockfiles, pulls only from the Local Skill Registry, checks signatures and Revocation Lists, prepares the Skill Cache, materializes read-only mounts, and updates status conditions for Agent Pods. This makes runtime injection declarative, auditable, recoverable, and aligned with Kubernetes ownership and reconcile semantics.

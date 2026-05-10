@@ -84,9 +84,49 @@ _Avoid_: denylist, blacklist
 The customer-environment registry that stores trusted Published Skill artifacts imported from an Offline Deployment Bundle.
 _Avoid_: local cache, file store
 
+**Air-Gapped Skill Distribution**:
+The offline distribution path that moves signed Skill artifacts, Agent Profiles, Skill Lockfiles, Policy Snapshots, SBOMs, provenance, and Revocation Lists from ADP into a customer environment without network connectivity.
+_Avoid_: upload, copy, sync
+
 **Offline Signing Component**:
 A Z-authorized customer-environment component that signs Local Published Skills within a limited customer scope.
 _Avoid_: local CA, customer signer
+
+**Skill Control Plane**:
+The ADP-side platform layer that governs Skill authoring, ingestion, evaluation, signing, publishing, dependency resolution, and offline export.
+_Avoid_: registry backend, marketplace service
+
+**Skill Data Plane**:
+The customer-environment runtime layer that imports, verifies, mounts, retrieves, hot-loads, invokes, traces, and revokes Skills.
+_Avoid_: runtime system, customer service
+
+**Agent Skill Operator**:
+The customer-environment Kubernetes Operator that reconciles Agent Profile declarations, Skill Lockfiles, Local Skill Registry artifacts, policy, and revocation state into mounted and verified Skills for Agent Pods.
+_Avoid_: controller, sync job
+
+**Skill Cache**:
+The node-local or cluster-local cache of verified Skill artifacts and unpacked payloads used by the Agent Skill Operator to reduce Pod startup latency and support deterministic hot-load.
+_Avoid_: temp dir, download cache
+
+**Skill Sidecar Runtime**:
+An isolated process in the Agent Pod that loads and invokes higher-risk or dependency-heavy Skills through the Skill Runtime Interface while enforcing local permission and trace contracts.
+_Avoid_: helper container, plugin server
+
+**Skill Loader**:
+The Agent Runtime module that discovers mounted Skills, verifies local metadata, performs compatibility checks, resolves task-time retrieval results, loads Runtime Payloads, and switches versions.
+_Avoid_: importer, dynamic loader
+
+**Semantic Skill Retrieval**:
+The task-time retrieval process that indexes Published Skill metadata, descriptions, schemas, examples, permission summaries, and evaluation summaries so the Agent loads only relevant Skills within its context budget.
+_Avoid_: search, recommendation
+
+**Progressive Skill Disclosure**:
+The runtime policy that exposes only compact Skill cards first, then loads full manifests, examples, assets, and Runtime Payloads only when a Skill is selected for use.
+_Avoid_: lazy loading, context trimming
+
+**Skill Trust Level**:
+The governance classification assigned to a Skill source and lifecycle state, such as Official, Internal, Reviewed Community, Unreviewed Community, Agent Generated, or Customer Local.
+_Avoid_: rating, category
 
 **Skill Workbench**:
 The ADP workspace where FDEs create, test, evaluate, and submit Skills through guided workflows.
@@ -136,9 +176,12 @@ The Pod that runs the deployed Agent workload.
 - A **Skill Draft** may become a **Published Skill** only after approval, build, scanning, and signing
 - FDEs and running Agents may create **Skill Drafts**, but only approved and signed drafts become deployable
 - A customer-environment **Skill Draft** may become a **Local Published Skill** after local evaluation, Tenant Admin approval, and signing by the **Offline Signing Component**
+- The **Skill Control Plane** exports **Air-Gapped Skill Distribution** bundles for the customer **Skill Data Plane**
+- The **Skill Data Plane** admits only artifacts imported into the **Local Skill Registry** or already present in the **Skill Cache**
 - A **Local Published Skill** may depend only on **Published Skills** or **Local Published Skills** already present in the same **Local Skill Registry**
 - A **Local Published Skill** must not depend directly on a **Community Skill**
 - A **Community Skill** must become an **Ingested Skill** before it can become a **Published Skill**
+- A **Skill Trust Level** is derived from the source, signing identity, approval evidence, and customer scope
 - A **Published Skill** may depend on zero or more **Skill Dependency** entries
 - A **Published Skill** declares a **Skill Runtime Mode**
 - A **Published Skill** declares a **Skill Permission Manifest**
@@ -160,8 +203,12 @@ The Pod that runs the deployed Agent workload.
 - A **Skill** is composed of a **Skill Manifest**, a **Runtime Payload**, **Skill Assets**, and **Evaluation Artifacts**
 - A **Skill Asset** may reference a **Knowledge Asset** instead of embedding large knowledge content directly
 - A **Controller** resolves and mounts the required **Published Skill** versions into the **Agent Pod**
+- An **Agent Skill Operator** is the production form of the customer-environment **Controller**
+- An **Agent Skill Operator** verifies and unpacks Skills into the **Skill Cache** before exposing them to an **Agent Pod**
 - A customer-environment **Controller** pulls only from the **Local Skill Registry** and local cache
 - A customer-environment **Controller** follows the **Skill Lockfile** and does not resolve version ranges
+- A **Skill Loader** uses **Semantic Skill Retrieval** and **Progressive Skill Disclosure** to select relevant mounted Skills at task time
+- A **Skill Sidecar Runtime** invokes isolated Skills through the **Skill Runtime Interface**
 - A running Agent may hot-load only **Published Skill** versions that are already mounted and signature-verified locally
 
 ## Example dialogue

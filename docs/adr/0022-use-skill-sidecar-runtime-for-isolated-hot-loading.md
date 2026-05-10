@@ -1,0 +1,3 @@
+# Use a Skill Sidecar Runtime for isolated hot-loading
+
+The Agent Runtime supports in-process loading for low-risk Skills, but production deployments must support a Skill Sidecar Runtime for Skills with heavier dependencies, broader permissions, or higher trust risk. The sidecar invokes Skills through the unified Skill Runtime Interface, receives only the mounted and verified Runtime Payloads selected by the Skill Loader, emits Skill Invocation Traces, and allows hot-load without restarting the Agent container. This keeps dynamic loading explicit while preserving stronger process isolation and language/runtime flexibility.

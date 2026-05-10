@@ -1,0 +1,3 @@
+# Use Semantic Skill Retrieval and Progressive Skill Disclosure
+
+Agents must not load every available Skill into context. ADP and the customer Skill Data Plane index compact Skill cards derived from manifests, schemas, examples, permission summaries, trust level, and evaluation summaries. At task time, the Skill Loader uses Semantic Skill Retrieval to select a small candidate set and applies Progressive Skill Disclosure: first expose compact cards, then load full manifests and assets only for selected Skills, and finally load Runtime Payloads only when invocation is needed. This controls context budget, reduces attack surface, and scales Skill reuse as the registry grows.
